@@ -63,7 +63,7 @@ OTP_VERIFY_RETRIES = 3   # how many times to re-poll + re-verify if OTP wrong/ex
 SPIN_RETRIES       = 5   # how many times to retry spin before giving up
 SPIN_RETRY_DELAY   = 3   # seconds between spin retries
 BATCH_SIZE         = 5          # concurrent phones per firebase link
-MAX_GLOBAL_SEM     = 200        # global cap — 1 slot per user for ~200 users
+MAX_GLOBAL_SEM     = 50        # global cap — 1 slot per user for ~200 users
 
 FIRST_NAMES = ["Rahul","Amit","Sanjay","Vivek","Arjun","Priya","Anjali","Neha","Pooja","Sakshi","Deepak","Rajesh","Manoj","Suresh","Anil"]
 SURNAMES    = ["Nair","Menon","Pillai","Kurian","Varma","Sharma","Kumar","Singh","Patel","Reddy"]
