@@ -1,2 +1,2 @@
-python-telegram-bot==21.9
+python-telegram-bot[job-queue]==21.9
 aiohttp==3.11.18
