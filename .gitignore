@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.db
+ujala_pack.jpg
+venv/
+.venv/
+env/
+node_modules/
+.DS_Store
