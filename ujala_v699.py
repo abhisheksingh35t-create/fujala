@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 # ============================================================
 #  ⚙️  CONFIG — EDIT THESE
 # ============================================================
-BOT_TOKEN               = "8629140265:AAFnAQbPOMnbMxX4U0SRu0ycRmrkkNMZftw"
+BOT_TOKEN               = "8812437801:AAGQ2kUS7JZPnZqF8SFN2R8HyDp2RVQa9zw"
 BOT_USERNAME            = ""   # startup pe auto-set hoga
 REQUIRED_CHANNELS       = ["@samaaaj_seva", "@earnwithsakx", "@blankkdealz", "@samaaaj_seva_disc"]
 ADMIN_IDS               = [6909647535, 1446058092, 6894923643]
