@@ -110,6 +110,15 @@ logging.basicConfig(
 )
 log = logging.getLogger("refer-bot")
 
+# The bot polls with allowed_updates=Update.ALL_TYPES, so a plain
+# `filters.TEXT & ~filters.COMMAND` also matches edited_message / channel_post
+# updates — not just brand-new messages. Every handler below calls
+# `update.message.reply_text(...)`, which is None on those update types and
+# throws AttributeError, causing a silent (unlogged-to-user) failure: the
+# person answers the captcha and the bot never responds. Restricting to
+# UpdateType.MESSAGE guarantees update.message is always populated.
+NEW_TEXT_FILTER = filters.TEXT & ~filters.COMMAND & filters.UpdateType.MESSAGE
+
 if not ADMIN_IDS:
     log.warning(
         "ADMIN_IDS is empty — no one will be able to open the admin panel. "
@@ -850,6 +859,11 @@ async def on_callback(update, context):
 # CAPTCHA HANDLER
 # =========================
 async def handle_captcha(update, context):
+    if not update.message:
+        # Shouldn't happen with NEW_TEXT_FILTER, but never assume — silently
+        # dropping the update is exactly the bug we're guarding against.
+        return WAIT_CAPTCHA
+
     expected = context.user_data.get("captcha_answer")
     if expected is None:
         await update.message.reply_text("Session expired. /start")
@@ -1345,6 +1359,23 @@ async def adm_broadcast(update, context):
     return ConversationHandler.END
 
 
+async def on_error(update, context):
+    """Global error handler: without this, an unhandled exception in any
+    handler is just logged server-side and the user gets total silence
+    (this is exactly what was happening — captcha answer in, nothing back
+    out, because a bad update type or a bug threw before any reply_text
+    call executed). Now we log AND tell the user something broke."""
+    log.error("Unhandled exception while processing update: %s", update, exc_info=context.error)
+    try:
+        effective_message = getattr(update, "effective_message", None) if update else None
+        if effective_message:
+            await effective_message.reply_text(
+                "⚠️ Something went wrong on our end. Please try /start again."
+            )
+    except Exception:
+        log.exception("on_error: even the fallback reply failed")
+
+
 async def fallback_text(update, context):
     uid = update.effective_user.id if update.effective_user else None
     if is_admin(uid):
@@ -1675,37 +1706,37 @@ def build_app() -> Application:
         ],
         states={
             WAIT_CAPTCHA: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_captcha),
+                MessageHandler(NEW_TEXT_FILTER, handle_captcha),
                 CommandHandler("cancel", cmd_cancel),
                 CallbackQueryHandler(on_callback),
             ],
             ADM_ADD_CODES: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_add_codes),
+                MessageHandler(NEW_TEXT_FILTER, adm_add_codes),
                 CommandHandler("cancel", cmd_cancel),
                 CallbackQueryHandler(on_callback),
             ],
             ADM_SET_SUPPORT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_set_support),
+                MessageHandler(NEW_TEXT_FILTER, adm_set_support),
                 CommandHandler("cancel", cmd_cancel),
                 CallbackQueryHandler(on_callback),
             ],
             ADM_SET_STORE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_set_store),
+                MessageHandler(NEW_TEXT_FILTER, adm_set_store),
                 CommandHandler("cancel", cmd_cancel),
                 CallbackQueryHandler(on_callback),
             ],
             ADM_ADD_CH_UN: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_add_ch_un),
+                MessageHandler(NEW_TEXT_FILTER, adm_add_ch_un),
                 CommandHandler("cancel", cmd_cancel),
                 CallbackQueryHandler(on_callback),
             ],
             ADM_ADD_CH_NAME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_add_ch_name),
+                MessageHandler(NEW_TEXT_FILTER, adm_add_ch_name),
                 CommandHandler("cancel", cmd_cancel),
                 CallbackQueryHandler(on_callback),
             ],
             ADM_BROADCAST: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_broadcast),
+                MessageHandler(NEW_TEXT_FILTER, adm_broadcast),
                 CommandHandler("cancel", cmd_cancel),
                 CallbackQueryHandler(on_callback),
             ],
@@ -1714,7 +1745,7 @@ def build_app() -> Application:
             CommandHandler("cancel", cmd_cancel),
             CommandHandler("start", cmd_start),
             CommandHandler("admin", cmd_admin),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_text),
+            MessageHandler(NEW_TEXT_FILTER, fallback_text),
         ],
         allow_reentry=True,
         per_message=False,
@@ -1722,6 +1753,7 @@ def build_app() -> Application:
         persistent=False,
     )
     app.add_handler(conv, group=1)
+    app.add_error_handler(on_error)
     app.post_init = post_init
     return app
 
