@@ -54,7 +54,7 @@ from telegram.ext import (
 # ============================================================
 # ★★★ SIRF YAHAN EDIT KARO — phir: python refer_bot.py
 # ============================================================
-BOT_TOKEN = "8902001047:AAFHTTsGNJ3ILC927wBGZgfTGcaJiVP7UZM"
+BOT_TOKEN = ""  # leave blank — set BOT_TOKEN in Railway's Variables tab instead
 ADMIN_IDS_RAW = "6894923643 1446058092 "
 SUPPORT_USERNAME = "blankk020"
 STORE_NAME = "UJALA STORE"
