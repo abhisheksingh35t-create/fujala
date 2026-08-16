@@ -54,7 +54,7 @@ from telegram.ext import (
 # ============================================================
 # ★★★ SIRF YAHAN EDIT KARO — phir: python refer_bot.py
 # ============================================================
-BOT_TOKEN = "8902001047:AAEAo6pzaz0CE0n8rQLDFgPSuIjfEBcGyW8"
+BOT_TOKEN = "8902001047:AAFHTTsGNJ3ILC927wBGZgfTGcaJiVP7UZM"
 ADMIN_IDS_RAW = "6894923643 1446058092 "
 SUPPORT_USERNAME = "blankk020"
 STORE_NAME = "UJALA STORE"
@@ -68,7 +68,12 @@ MAX_REDEMPTIONS_PER_DAY = 2
 
 ADMIN_IDS = {int(x.strip()) for x in ADMIN_IDS_RAW.split() if x.strip()}
 
-BASE_DIR = Path(__file__).resolve().parent
+# DATA_DIR: where refer_data.json + backups/ live. On Railway, set this to
+# your volume's mount path (e.g. /data) via an environment variable, so
+# data survives redeploys/restarts. Falls back to the script's own folder
+# for local runs where no volume is involved.
+BASE_DIR = Path(os.getenv("DATA_DIR", str(Path(__file__).resolve().parent)))
+BASE_DIR.mkdir(parents=True, exist_ok=True)
 DATA_FILE = BASE_DIR / "refer_data.json"
 
 (
